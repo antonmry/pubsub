@@ -21,6 +21,8 @@ import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.batching.BatchingSettings;
 import com.google.api.gax.retrying.RetrySettings;
 import com.google.cloud.pubsub.v1.Publisher;
+import com.google.cloud.pubsublite.*;
+import com.google.cloud.pubsublite.cloudpubsub.PublisherSettings;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.ByteString;
 import com.google.pubsub.kafka.common.ConnectorUtils;
@@ -38,6 +40,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
@@ -67,6 +70,9 @@ public class CloudPubSubSinkTask extends SinkTask {
       new HashMap<>();
   private String cpsProject;
   private String cpsTopic;
+  private boolean lite;
+  private String cpsCloudRegion;
+  private String cpsZoneId;
   private String messageBodyName;
   private long maxBufferSize;
   private long maxBufferBytes;
@@ -79,8 +85,11 @@ public class CloudPubSubSinkTask extends SinkTask {
   private OrderingKeySource orderingKeySource;
   private ConnectorCredentialsProvider gcpCredentialsProvider;
   private com.google.cloud.pubsub.v1.Publisher publisher;
+  private com.google.cloud.pubsublite.cloudpubsub.Publisher litePublisher;
 
-  /** Holds a list of the publishing futures that have not been processed for a single partition. */
+  /**
+   * Holds a list of the publishing futures that have not been processed for a single partition.
+   */
   private class OutstandingFuturesForPartition {
     public List<ApiFuture<String>> futures = new ArrayList<>();
   }
@@ -94,11 +103,17 @@ public class CloudPubSubSinkTask extends SinkTask {
     public int size = 0;
   }
 
-  public CloudPubSubSinkTask() {}
+  public CloudPubSubSinkTask() {
+  }
 
   @VisibleForTesting
   public CloudPubSubSinkTask(Publisher publisher) {
     this.publisher = publisher;
+  }
+
+  @VisibleForTesting
+  public CloudPubSubSinkTask(com.google.cloud.pubsublite.cloudpubsub.Publisher litePublisher) {
+    this.litePublisher = litePublisher;
   }
 
   @Override
@@ -111,6 +126,9 @@ public class CloudPubSubSinkTask extends SinkTask {
     Map<String, Object> validatedProps = new CloudPubSubSinkConnector().config().parse(props);
     cpsProject = validatedProps.get(ConnectorUtils.CPS_PROJECT_CONFIG).toString();
     cpsTopic = validatedProps.get(ConnectorUtils.CPS_TOPIC_CONFIG).toString();
+    lite = (Boolean) validatedProps.get(ConnectorUtils.CPS_LITE);
+    cpsCloudRegion = (String) validatedProps.get(ConnectorUtils.CPS_CLOUD_REGION);
+    cpsZoneId = (String) validatedProps.get(ConnectorUtils.CPS_ZONE_ID);
     maxBufferSize = (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_BUFFER_SIZE_CONFIG);
     maxBufferBytes = (Long) validatedProps.get(CloudPubSubSinkConnector.MAX_BUFFER_BYTES_CONFIG);
     maxDelayThresholdMs =
@@ -143,10 +161,14 @@ public class CloudPubSubSinkTask extends SinkTask {
         throw new RuntimeException(e);
       }
     }
-    if (publisher == null) {
+    if (publisher == null && litePublisher == null) {
       // Only do this if we did not use the constructor.
       createPublisher();
     }
+
+    if (lite)
+      litePublisher.startAsync();
+
     log.info("Start CloudPubSubSinkTask");
   }
 
@@ -202,7 +224,7 @@ public class CloudPubSubSinkTask extends SinkTask {
 
   private Iterable<? extends Header> getRecordHeaders(SinkRecord record) {
     ConnectHeaders headers = new ConnectHeaders();
-    if(record.headers() != null) {
+    if (record.headers() != null) {
       int headerCount = 0;
       for (Header header : record.headers()) {
         if (header.key().getBytes().length < 257 &&
@@ -283,7 +305,7 @@ public class CloudPubSubSinkTask extends SinkTask {
           if (val == null) {
             if (!f.schema().isOptional()) {
               throw new DataException("Struct message missing required field " + f.name());
-            }  else {
+            } else {
               continue;
             }
           }
@@ -358,9 +380,15 @@ public class CloudPubSubSinkTask extends SinkTask {
     allOutstandingFutures.clear();
   }
 
-  /** Publish all the messages in a partition and store the Future's for each publish request. */
+  /**
+   * Publish all the messages in a partition and store the Future's for each publish request.
+   */
   private void publishMessage(String topic, Integer partition, PubsubMessage message) {
-    addPendingMessageFuture(topic, partition, publisher.publish(message));
+    if (lite) {
+      addPendingMessageFuture(topic, partition, litePublisher.publish(message));
+    } else {
+      addPendingMessageFuture(topic, partition, publisher.publish(message));
+    }
   }
 
   private void addPendingMessageFuture(String topic, Integer partition, ApiFuture<String> future) {
@@ -381,32 +409,54 @@ public class CloudPubSubSinkTask extends SinkTask {
   }
 
   private void createPublisher() {
-    ProjectTopicName fullTopic = ProjectTopicName.of(cpsProject, cpsTopic);
-    com.google.cloud.pubsub.v1.Publisher.Builder builder =
-        com.google.cloud.pubsub.v1.Publisher.newBuilder(fullTopic)
-            .setCredentialsProvider(gcpCredentialsProvider)
-            .setBatchingSettings(
-                BatchingSettings.newBuilder()
-                    .setDelayThreshold(Duration.ofMillis(maxDelayThresholdMs))
-                    .setElementCountThreshold(maxBufferSize)
-                    .setRequestByteThreshold(maxBufferBytes)
-                    .build())
-            .setRetrySettings(
-                RetrySettings.newBuilder()
-                    // All values that are not configurable come from the defaults for the publisher
-                    // client library.
-                    .setTotalTimeout(Duration.ofMillis(maxTotalTimeoutMs))
-                    .setMaxRpcTimeout(Duration.ofMillis(maxRequestTimeoutMs))
-                    .setInitialRetryDelay(Duration.ofMillis(5))
-                    .setRetryDelayMultiplier(2)
-                    .setMaxRetryDelay(Duration.ofMillis(Long.MAX_VALUE))
-                    .setInitialRpcTimeout(Duration.ofSeconds(10))
-                    .setRpcTimeoutMultiplier(2)
-                    .build());
-    try {
-      publisher = builder.build();
-    } catch (Exception e) {
-      throw new RuntimeException(e);
+    if (lite) {
+      TopicPath topicPath =
+          TopicPath.newBuilder()
+              .setProject(ProjectId.of(cpsProject))
+              .setLocation(CloudZone.of(CloudRegion.of(cpsCloudRegion), cpsZoneId.charAt(0)))
+              .setName(TopicName.of(cpsTopic))
+              .build();
+
+      com.google.cloud.pubsublite.cloudpubsub.PublisherSettings publisherSettings =
+          PublisherSettings.newBuilder()
+              .setTopicPath(topicPath)
+              .setBatchingSettings(
+                  BatchingSettings.newBuilder()
+                      .setDelayThreshold(Duration.ofMillis(maxDelayThresholdMs))
+                      .setElementCountThreshold(maxBufferSize)
+                      .setRequestByteThreshold(maxBufferBytes)
+                      .build())
+              .build();
+
+      this.litePublisher = com.google.cloud.pubsublite.cloudpubsub.Publisher.create(publisherSettings);
+    } else {
+      ProjectTopicName fullTopic = ProjectTopicName.of(cpsProject, cpsTopic);
+      com.google.cloud.pubsub.v1.Publisher.Builder builder =
+          com.google.cloud.pubsub.v1.Publisher.newBuilder(fullTopic)
+              .setCredentialsProvider(gcpCredentialsProvider)
+              .setBatchingSettings(
+                  BatchingSettings.newBuilder()
+                      .setDelayThreshold(Duration.ofMillis(maxDelayThresholdMs))
+                      .setElementCountThreshold(maxBufferSize)
+                      .setRequestByteThreshold(maxBufferBytes)
+                      .build())
+              .setRetrySettings(
+                  RetrySettings.newBuilder()
+                      // All values that are not configurable come from the defaults for the publisher
+                      // client library.
+                      .setTotalTimeout(Duration.ofMillis(maxTotalTimeoutMs))
+                      .setMaxRpcTimeout(Duration.ofMillis(maxRequestTimeoutMs))
+                      .setInitialRetryDelay(Duration.ofMillis(5))
+                      .setRetryDelayMultiplier(2)
+                      .setMaxRetryDelay(Duration.ofMillis(Long.MAX_VALUE))
+                      .setInitialRpcTimeout(Duration.ofSeconds(10))
+                      .setRpcTimeoutMultiplier(2)
+                      .build());
+      try {
+        publisher = builder.build();
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
     }
   }
 
@@ -427,5 +477,18 @@ public class CloudPubSubSinkTask extends SinkTask {
         log.error("An exception occurred while shutting down PubSub publisher", e);
       }
     }
+
+    if (litePublisher != null) {
+      log.info("Shutting down PubSub Lite publisher");
+      try {
+        litePublisher.stopAsync().awaitTerminated(maxShutdownTimeoutMs, TimeUnit.MILLISECONDS);
+      } catch (TimeoutException e) {
+        log.warn(String.format("PubSub Lite publisher did not terminate cleanly in %d ms", maxShutdownTimeoutMs));
+      } catch (Exception e) {
+        // There is not much we can do here besides logging it as an error
+        log.error("An exception occurred while shutting down PubSub publisher", e);
+      }
+    }
   }
+
 }
